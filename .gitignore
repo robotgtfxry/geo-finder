@@ -1,0 +1,11 @@
+# serwer
+server/geofinder.db
+server/web/
+__pycache__/
+.venv/
+
+# flutter
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
