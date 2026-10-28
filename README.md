@@ -43,7 +43,7 @@ flutter build apk --release   # plik APK do rozesłania uczestnikom
 **Wersja przeglądarkowa** (wygodna dla koordynatora na laptopie):
 
 ```bash
-flutter build web
+flutter build web --no-web-resources-cdn
 # skopiuj app/build/web do server/web, a serwer sam ją udostępni pod http://<serwer>:8000/
 ```
 
@@ -73,6 +73,54 @@ Na Windows: `xcopy /E /I app\build\web server\web`.
    Zgłoszenie dostaje pozycję telefonu. Żeby wskazać inne miejsce, przytrzymaj palec na mapie.
    Wszyscy dostają powiadomienie, np. „W kwadracie C4 znaleziono ślad”.
 
+## Kamera na żywo
+
+- **Uczestnik** naciska czerwony przycisk **„Kamera”**. Telefon nadaje obraz z tylnej kamery
+  (z dźwiękiem, mikrofon można wyciszyć). Na mapie koordynatora jego kropka dostaje
+  czerwoną obwódkę i podpis „● imię”.
+- **Koordynator** dotyka kropki uczestnika (albo osoby na liście „Uczestnicy”) i wybiera
+  **„Oglądaj na żywo”**. Jeśli ktoś nie nadaje, przycisk **„Poproś o kamerę”** wyświetla
+  mu okno z prośbą. Po zgodzie podgląd otwiera się koordynatorowi sam.
+- Obraz idzie **bezpośrednio z telefonu do koordynatora** (WebRTC), więc w sieci lokalnej
+  działa bez internetu. Gdy serwer stoi w internecie, a telefony są na danych komórkowych,
+  połączenie może wymagać serwera TURN (nie jest dołączony).
+
+## Menu uczestnika (koordynator)
+
+Dotknięcie kropki na mapie albo osoby na liście otwiera jej menu:
+- oglądanie kamery albo prośba o jej włączenie, „Pokaż na mapie”,
+- **zmiana nazwy**,
+- **kolor kropki** (i jej śladu na mapie),
+- **promień przeszukiwania**, ustawiany suwakiem 1–50 m,
+- usunięcie z akcji (przeszukany przez tę osobę teren zostaje na mapie).
+
+## Praca bez internetu
+
+Cały system może działać **bez internetu**, w samej sieci lokalnej:
+
+```
+ [telefon] ─┐
+ [telefon] ─┼── Wi-Fi / hotspot ──► [laptop z serwerem]  (internet niepotrzebny)
+ [telefon] ─┘
+```
+
+1. **Przed wyjazdem**, kiedy serwer ma jeszcze internet: koordynator zaznacza obszar i
+   naciska **„Mapa offline”**. Serwer pobiera mapę obszaru (przybliżenia 12–18) i trzyma ją
+   w `server/tiles/`. Telefony same ściągają tę mapę z serwera do swojej pamięci, kiedy
+   tylko się połączą.
+2. **W terenie** telefony łączą się z serwerem po Wi-Fi albo hotspocie, np. adres
+   `192.168.43.1:8000`. Mapę biorą z pamięci telefonu albo z serwera.
+
+**Gdy ktoś straci zasięg:**
+- W ciągu kilku sekund pojawia się **czerwony pasek „BRAK POŁĄCZENIA”**.
+- Aplikacja **działa dalej normalnie**: GPS, ślad, mapa i zgłoszenia działają. Wszystko
+  zapisuje się w telefonie, nawet jeśli telefon się wyłączy albo aplikacja się zrestartuje.
+- Po powrocie sieci pasek robi się pomarańczowy, **„Wysyłam zaległe dane…”**. Ślad i
+  zgłoszenia dochodzą na serwer z **oryginalnym czasem**, więc koordynator zobaczy dokładnie,
+  gdzie dana osoba chodziła. Telefon pokaże też zgłoszenia innych, które przegapił.
+- Koordynator widzi przy takiej osobie dopisek *„(bez sieci 5 min temu)”*, a jej kropka
+  jest przygaszona.
+
 ## Uwagi
 
 - **Powiadomienia:** w trakcie akcji aplikacja trzyma stałe połączenie z serwerem. Na
@@ -80,8 +128,12 @@ Na Windows: `xcopy /E /I app\build\web server\web`.
   powiadomienia i zapis śladu działają też przy wygaszonym ekranie. Na webie i Windows
   zgłoszenie pokazuje się jako baner w oknie. Firebase (FCM) nie jest potrzebny, a cały
   system może działać w sieci lokalnej bez internetu.
-- **Mapy offline:** kafelki OpenStreetMap wymagają internetu. W terenie bez zasięgu
-  przybliż wcześniej obszar akcji, żeby kafelki trafiły do pamięci podręcznej.
+- **Mapy:** domyślnie z OpenStreetMap. Zasady OSM nie pozwalają na masowe pobieranie,
+  dlatego obszar offline ma limit 8000 kafelków (to kilka–kilkanaście km²). Inne źródło map
+  ustawisz zmienną `TILE_URL`.
+- **Wersja web bez internetu:** buduj ją poleceniem
+  `flutter build web --no-web-resources-cdn`, żeby nie potrzebowała serwerów Google.
+  W terenie bez internetu pewniejsza jest aplikacja na Androida albo na komputer.
 - **Kalibracja** usuwa stały błąd danego telefonu w danym miejscu i czasie. Błąd GPS z
   czasem się zmienia, więc warto kalibrować na początku każdej zmiany i po dłuższej przerwie.
 - **iOS:** zapis w tle wymaga zgody na lokalizację „Zawsze”. Skrypt `tool/setup.dart`

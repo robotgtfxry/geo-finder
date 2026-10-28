@@ -2,22 +2,30 @@
 
 Uruchomienie:  uvicorn app:app --host 0.0.0.0 --port 8000
 """
+import asyncio
 import json
+import math
 import os
 import secrets
 import sqlite3
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE = Path(__file__).parent
 DB_PATH = os.environ.get("GEOFINDER_DB", str(BASE / "geofinder.db"))
 WEB_DIR = Path(os.environ.get("GEOFINDER_WEB", BASE / "web"))   # wynik `flutter build web`
+TILES_DIR = Path(os.environ.get("GEOFINDER_TILES", BASE / "tiles"))
+TILE_URL = os.environ.get("TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+TILE_MIN_ZOOM, TILE_MAX_ZOOM = 12, 18   # zakres pobierany do pracy offline
+TILE_LIMIT = 8000                       # ochrona przed ściąganiem pół kraju
 
 COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6",
           "#9a6324", "#800000", "#808000", "#000075", "#469990", "#bfef45", "#dcbeff"]
@@ -180,16 +188,28 @@ def require_user(authorization):
 
 # ---------------------------------------------------------------- websocket
 
-clients: set[WebSocket] = set()
+# każde połączenie: {"cid": id połączenia, "role": "user"/"admin", "user": id uczestnika albo None}
+clients: dict[WebSocket, dict] = {}
+# kto teraz nadaje obraz z kamery: id uczestnika -> cid jego połączenia
+live: dict[int, str] = {}
+
+
+async def send(ws, msg):
+    try:
+        await ws.send_text(json.dumps(msg))
+    except Exception:
+        clients.pop(ws, None)
 
 
 async def broadcast(msg):
-    data = json.dumps(msg)
     for ws in list(clients):
-        try:
-            await ws.send_text(data)
-        except Exception:
-            clients.discard(ws)
+        await send(ws, msg)
+
+
+async def send_where(pred, msg):
+    for ws, info in list(clients.items()):
+        if pred(info):
+            await send(ws, msg)
 
 
 # ---------------------------------------------------------------- API
@@ -257,6 +277,7 @@ class FixIn(BaseModel):
     lon: float
     acc: float = 0
     t: Optional[float] = None
+    r: Optional[float] = Field(None, gt=0, le=500)   # promień, z jakim punkt zapisano (ważne przy dosyłaniu offline)
 
 
 class PointsIn(BaseModel):
@@ -276,9 +297,10 @@ async def add_points(body: PointsIn, authorization: Optional[str] = Header(None)
         for p in body.points:
             if p.acc > max_acc:
                 continue
+            r = p.r or user["radius"]
             cur = db.execute("INSERT INTO points (user_id, lat, lon, r, t) VALUES (?, ?, ?, ?, ?)",
-                             (user["id"], p.lat, p.lon, user["radius"], p.t or now))
-            added.append([cur.lastrowid, user["id"], p.lat, p.lon, user["radius"], p.t or now])
+                             (user["id"], p.lat, p.lon, r, p.t or now))
+            added.append([cur.lastrowid, user["id"], p.lat, p.lon, r, p.t or now])
     last = body.points[-1]
     db.execute("UPDATE users SET lat=?, lon=?, acc=?, last_seen=? WHERE id=?",
                (last.lat, last.lon, last.acc, now, user["id"]))
@@ -314,6 +336,7 @@ class ReportIn(BaseModel):
     lon: float
     category: str = "other"
     text: str = Field("", max_length=500)
+    t: Optional[float] = None   # czas zgłoszenia na telefonie (gdy wysłane z opóźnieniem po braku sieci)
 
 
 @app.post("/api/reports")
@@ -321,8 +344,9 @@ async def add_report(body: ReportIn, authorization: Optional[str] = Header(None)
     user = require_user(authorization)
     category = body.category if body.category in CATEGORIES else "other"
     cell = cell_of(get_settings(), body.lat, body.lon)
+    t = min(body.t or time.time(), time.time())
     cur = db.execute("INSERT INTO reports (user_id, lat, lon, cell, category, text, t) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     (user["id"], body.lat, body.lon, cell, category, body.text.strip(), time.time()))
+                     (user["id"], body.lat, body.lon, cell, category, body.text.strip(), t))
     db.commit()
     report = report_json(db.execute("SELECT * FROM reports WHERE id=?", (cur.lastrowid,)).fetchone())
     await broadcast({"type": "report", "report": report})
@@ -393,6 +417,7 @@ async def delete_user(user_id: int, authorization: Optional[str] = Header(None))
     # punkty zostają – teren przeszukany przez tę osobę nadal jest przeszukany
     db.execute("DELETE FROM users WHERE id=?", (user_id,))
     db.commit()
+    live.pop(user_id, None)
     await broadcast({"type": "user_deleted", "id": user_id})
     return {"ok": True}
 
@@ -418,19 +443,162 @@ async def clear_coverage(authorization: Optional[str] = Header(None)):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = ""):
     try:
-        auth(f"Bearer {token}")
+        role, user = auth(f"Bearer {token}")
     except HTTPException:
         await ws.close(code=4401)
         return
     await ws.accept()
-    clients.add(ws)
+    info = {"cid": secrets.token_hex(6), "role": role, "user": user["id"] if user else None}
+    clients[ws] = info
+    await send(ws, {"type": "hello", "cid": info["cid"], "live": {str(k): v for k, v in live.items()}})
     try:
         while True:
-            await ws.receive_text()   # klient może wysyłać "ping"; nic więcej nie odbieramy
+            text = await ws.receive_text()
+            # klient co kilka sekund wysyła "ping"; brak "pong" = klient od razu wie, że stracił sieć
+            if text == "ping":
+                await ws.send_text('{"type": "pong"}')
+                continue
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                continue
+            await handle_ws_message(info, msg)
     except WebSocketDisconnect:
         pass
     finally:
-        clients.discard(ws)
+        clients.pop(ws, None)
+        uid = info["user"]
+        if uid is not None and live.get(uid) == info["cid"]:
+            del live[uid]
+            await broadcast({"type": "live", "id": uid, "cid": None})
+
+
+# ---------------------------------------------------------------- kamera na żywo
+# Obraz idzie bezpośrednio telefon -> koordynator (WebRTC, działa w sieci lokalnej
+# bez internetu). Serwer tylko przekazuje wiadomości zestawiające połączenie.
+
+async def handle_ws_message(info, msg):
+    kind = msg.get("type")
+    uid = info["user"]
+
+    if kind == "live" and info["role"] == "user":
+        # uczestnik włączył / wyłączył kamerę
+        if msg.get("live"):
+            live[uid] = info["cid"]
+        elif live.get(uid) == info["cid"]:
+            del live[uid]
+        else:
+            return
+        await broadcast({"type": "live", "id": uid, "cid": live.get(uid)})
+
+    elif kind == "rtc":
+        # sygnalizacja WebRTC – zawsze między uczestnikiem a koordynatorem
+        to = msg.get("to")
+        target = next((i for i in clients.values() if i["cid"] == to), None)
+        if target is None or (info["role"] != "admin" and target["role"] != "admin"):
+            return
+        await send_where(lambda i: i["cid"] == to,
+                         {"type": "rtc", "from": info["cid"], "data": msg.get("data")})
+
+    elif kind == "stream_request" and info["role"] == "admin":
+        # koordynator prosi uczestnika o włączenie kamery
+        to_user = msg.get("user")
+        await send_where(lambda i: i["user"] == to_user, {"type": "stream_request", "from": info["cid"]})
+
+    elif kind == "stream_declined" and info["role"] == "user":
+        to = msg.get("to")
+        await send_where(lambda i: i["cid"] == to, {"type": "stream_declined", "id": uid})
+
+
+# ---------------------------------------------------------------- mapy offline
+# Serwer jest pośrednikiem i magazynem kafelków: co raz pobrał, trzyma na dysku,
+# więc w terenie bez internetu telefony dostają mapę z serwera lokalnego.
+
+def tile_path(z, x, y):
+    return TILES_DIR / str(z) / str(x) / f"{y}.png"
+
+
+def download_tile(z, x, y):
+    req = urllib.request.Request(TILE_URL.format(z=z, x=x, y=y),
+                                 headers={"User-Agent": "GeoFinder/1.0 (koordynacja poszukiwan)"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = r.read()
+    path = tile_path(z, x, y)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return data
+
+
+def tiles_for_area(area):
+    def tx(lon, z):
+        return int((lon + 180) / 360 * 2 ** z)
+
+    def ty(lat, z):
+        r = math.radians(lat)
+        return int((1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2 * 2 ** z)
+
+    out = []
+    for z in range(TILE_MIN_ZOOM, TILE_MAX_ZOOM + 1):
+        for x in range(tx(area["west"], z), tx(area["east"], z) + 1):
+            for y in range(ty(area["north"], z), ty(area["south"], z) + 1):
+                out.append((z, x, y))
+    return out
+
+
+@app.get("/tiles/{z}/{x}/{y}.png")
+async def tile(z: int, x: int, y: int):
+    if not (0 <= z <= 19 and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+        raise HTTPException(404)
+    path = tile_path(z, x, y)
+    if path.exists():
+        return FileResponse(path, media_type="image/png", headers={"Cache-Control": "max-age=604800"})
+    try:
+        data = await asyncio.to_thread(download_tile, z, x, y)
+    except Exception:
+        raise HTTPException(404, "Kafelka nie ma w pamięci, a serwer nie ma internetu")
+    return Response(data, media_type="image/png")
+
+
+tile_job = {"running": False, "done": 0, "total": 0, "failed": 0}
+
+
+async def prefetch_tiles(tiles):
+    tile_job.update(running=True, done=0, total=len(tiles), failed=0)
+    try:
+        for i, (z, x, y) in enumerate(tiles):
+            if not tile_path(z, x, y).exists():
+                try:
+                    await asyncio.to_thread(download_tile, z, x, y)
+                    await asyncio.sleep(0.05)   # nie zasypujemy serwera kafelków
+                except Exception:
+                    tile_job["failed"] += 1
+            tile_job["done"] = i + 1
+            if i % 25 == 0 or i + 1 == len(tiles):
+                await broadcast({"type": "tiles", **tile_job})
+    finally:
+        tile_job["running"] = False
+        await broadcast({"type": "tiles", **tile_job})
+
+
+@app.post("/api/tiles/prefetch")
+async def tiles_prefetch(authorization: Optional[str] = Header(None)):
+    require_admin(authorization)
+    area = get_settings()["area"]
+    if not area:
+        raise HTTPException(400, "Najpierw zaznacz obszar")
+    if tile_job["running"]:
+        return tile_job
+    tiles = tiles_for_area(area)
+    if len(tiles) > TILE_LIMIT:
+        raise HTTPException(400, f"Obszar za duży na mapy offline ({len(tiles)} kafelków, limit {TILE_LIMIT})")
+    asyncio.create_task(prefetch_tiles(tiles))
+    return {**tile_job, "running": True, "total": len(tiles)}
+
+
+@app.get("/api/tiles/status")
+async def tiles_status(authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    return tile_job
 
 
 # Webowa wersja aplikacji Flutter (montowana na końcu, żeby nie przysłaniała /api i /ws)

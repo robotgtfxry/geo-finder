@@ -34,7 +34,7 @@ Color parseColor(String hex) =>
     Color(int.parse(hex.replaceFirst('#', ''), radix: 16) | 0xFF000000);
 
 String colorToHex(Color c) =>
-    '#${(c.value & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+    '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
 
 double _d(dynamic v) => (v as num).toDouble();
 double? _dn(dynamic v) => v == null ? null : (v as num).toDouble();

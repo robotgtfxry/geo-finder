@@ -12,7 +12,9 @@ void main() async {
   );
   stdout.write(create.stdout);
   stderr.write(create.stderr);
-  if (create.exitCode != 0) exit(create.exitCode);
+  // na Windows bez trybu dewelopera `flutter create` kończy się ostrzeżeniem o
+  // symlinkach, ale pliki platform już powstały – łatamy je mimo to
+  if (create.exitCode != 0 && !Directory('android').existsSync()) exit(create.exitCode);
 
   _android();
   _ios();
@@ -44,6 +46,12 @@ void _android() {
     'android.permission.POST_NOTIFICATIONS',
     'android.permission.WAKE_LOCK',
     'android.permission.VIBRATE',
+    // kamera na żywo (WebRTC)
+    'android.permission.CAMERA',
+    'android.permission.RECORD_AUDIO',
+    'android.permission.MODIFY_AUDIO_SETTINGS',
+    'android.permission.ACCESS_NETWORK_STATE',
+    'android.permission.CHANGE_NETWORK_STATE',
   ];
   _patch('android/app/src/main/AndroidManifest.xml', (s) {
     for (final p in perms) {
@@ -86,17 +94,27 @@ void _ios() {
   _patch('ios/Runner/Info.plist', (s) => _plistKeys(s, {
         'NSLocationWhenInUseUsageDescription': _why,
         'NSLocationAlwaysAndWhenInUseUsageDescription': _why,
+        'NSCameraUsageDescription': _whyCamera,
+        'NSMicrophoneUsageDescription': _whyCamera,
         'UIBackgroundModes': '<array>\n\t\t<string>location</string>\n\t</array>',
         'NSAppTransportSecurity': '<dict>\n\t\t<key>NSAllowsArbitraryLoads</key>\n\t\t<true/>\n\t</dict>',
       }));
 }
 
+const _whyCamera = '<string>Na prośbę koordynatora możesz przesłać mu obraz z kamery na żywo.</string>';
+
 void _macos() {
-  _patch('macos/Runner/Info.plist', (s) => _plistKeys(s, {'NSLocationUsageDescription': _why}));
+  _patch('macos/Runner/Info.plist', (s) => _plistKeys(s, {
+        'NSLocationUsageDescription': _why,
+        'NSCameraUsageDescription': _whyCamera,
+        'NSMicrophoneUsageDescription': _whyCamera,
+      }));
   for (final f in ['macos/Runner/DebugProfile.entitlements', 'macos/Runner/Release.entitlements']) {
     _patch(f, (s) => _plistKeys(s, {
           'com.apple.security.network.client': '<true/>',
           'com.apple.security.personal-information.location': '<true/>',
+          'com.apple.security.device.camera': '<true/>',
+          'com.apple.security.device.audio-input': '<true/>',
         }));
   }
 }

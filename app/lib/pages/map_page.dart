@@ -8,8 +8,11 @@ import 'package:latlong2/latlong.dart';
 import '../models.dart';
 import '../notifications.dart';
 import '../session.dart';
+import '../tiles/cached_tiles.dart';
 import 'dialogs.dart';
 import 'login_page.dart';
+import 'stream_pages.dart';
+import 'users_menu.dart';
 
 enum AdminTool { none, area, calib }
 
@@ -30,12 +33,17 @@ class _MapPageState extends State<MapPage> {
   bool _mapReady = false, _fitted = false, _follow = false, _leaving = false;
 
   SessionController get s => widget.session;
+  late final _tiles = CachedTileProvider(s.api.base);
 
   @override
   void initState() {
     super.initState();
     s.addListener(_onSession);
     _reportSub = s.incomingReports.listen(_showReportBanner);
+    _streamSubs = [
+      s.streamRequests.listen(_onStreamRequest),
+      s.streamAnswers.listen(_onStreamAnswer),
+    ];
     Notifier.onTap = (id) {
       final r = s.reports.where((r) => r.id == id).firstOrNull;
       if (r != null) _goTo(LatLng(r.lat, r.lon));
@@ -47,8 +55,71 @@ class _MapPageState extends State<MapPage> {
   void dispose() {
     s.removeListener(_onSession);
     _reportSub?.cancel();
+    for (final sub in _streamSubs) {
+      sub.cancel();
+    }
     Notifier.onTap = null;
     super.dispose();
+  }
+
+  // ------------------------------------------------------------ kamera na żywo
+
+  List<StreamSubscription> _streamSubs = const [];
+  bool _broadcasting = false;
+
+  late final _userActions = UserActions(
+    showOnMap: (u) => _goTo(LatLng(u.lat!, u.lon!)),
+    watch: _watch,
+  );
+
+  void _watch(AppUser u) => Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => ViewerPage(session: s, user: u)),
+      );
+
+  Future<void> _broadcast() async {
+    if (_broadcasting) return;
+    _broadcasting = true;
+    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => BroadcastPage(session: s)));
+    _broadcasting = false;
+  }
+
+  /// Uczestnik: koordynator prosi o obraz z kamery.
+  Future<void> _onStreamRequest(String adminCid) async {
+    if (!mounted || _broadcasting) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.videocam, size: 40, color: Colors.red),
+        title: const Text('Koordynator prosi o obraz z kamery'),
+        content: const Text('Włącz kamerę i pokaż, co widzisz. Obraz zobaczy tylko koordynator.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Nie teraz')),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            icon: const Icon(Icons.videocam),
+            label: const Text('Włącz kamerę'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      _broadcast();
+    } else {
+      s.declineStream(adminCid);
+    }
+  }
+
+  /// Koordynator: odpowiedź na prośbę o kamerę.
+  void _onStreamAnswer(int id) {
+    if (!mounted) return;
+    final u = s.users[id.abs()];
+    if (u == null) return;
+    if (id > 0) {
+      _watch(u);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${u.name} nie może teraz włączyć kamery')));
+    }
   }
 
   void _onSession() {
@@ -170,11 +241,15 @@ class _MapPageState extends State<MapPage> {
     final strokes = s.strokes;
     final fix = s.myFix;
     return [
+      // mapa idzie przez serwer GeoFinder i jest zapamiętywana w telefonie –
+      // działa w terenie bez internetu (patrz tiles/cached_tiles.dart)
       TileLayer(
-        urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+        urlTemplate: '${s.api.base}/tiles/{z}/{x}/{y}.png',
+        tileProvider: _tiles,
         userAgentPackageName: 'pl.geofinder',
-        maxNativeZoom: 19,
+        maxNativeZoom: TileCache.maxZoom,
         maxZoom: 21,
+        evictErrorTileStrategy: EvictErrorTileStrategy.dispose, // brakujący kafelek spróbuje ponownie
       ),
       // przeszukany teren – „mazak” o szerokości 2 × promień osoby
       Opacity(
@@ -220,7 +295,7 @@ class _MapPageState extends State<MapPage> {
             point: fix.latLng,
             radius: fix.acc,
             useRadiusInMeter: true,
-            color: Colors.blue.withOpacity(0.12),
+            color: Colors.blue.withValues(alpha: 0.12),
           ),
           CircleMarker(
             point: fix.latLng,
@@ -304,27 +379,40 @@ class _MapPageState extends State<MapPage> {
         width: 140,
         height: 20,
         alignment: const Alignment(0.9, 0), // kropka trafia w pozycję, podpis po prawej
-        child: Opacity(
-          opacity: u.stale ? 0.45 : 1,
-          child: Row(children: [
-            Container(
-              width: 14,
-              height: 14,
-              decoration: BoxDecoration(
-                color: u.color,
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white, width: 2),
+        child: GestureDetector(
+          // koordynator: dotknięcie kropki otwiera menu tej osoby
+          onTap: s.isAdmin ? () => showUserMenu(context, s, u.id, _userActions) : null,
+          child: Opacity(
+            opacity: u.stale ? 0.45 : 1,
+            child: Row(children: [
+              Container(
+                width: 14,
+                height: 14,
+                decoration: BoxDecoration(
+                  color: u.color,
+                  shape: BoxShape.circle,
+                  // czerwona obwódka = nadaje obraz z kamery
+                  border: Border.all(color: s.isLive(u.id) ? Colors.red : Colors.white, width: s.isLive(u.id) ? 3 : 2),
+                ),
               ),
-            ),
-            const SizedBox(width: 3),
-            Flexible(
-              child: Container(
-                color: Colors.white70,
-                padding: const EdgeInsets.symmetric(horizontal: 2),
-                child: Text(u.name, style: const TextStyle(fontSize: 11, color: Colors.black), overflow: TextOverflow.ellipsis),
+              const SizedBox(width: 3),
+              Flexible(
+                child: Container(
+                  color: s.isLive(u.id) ? Colors.red : Colors.white70,
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: Text(
+                    s.isLive(u.id)
+                        ? '● ${u.name}'
+                        : u.stale
+                            ? '${u.name} (bez sieci ${ago(u.lastSeen)})'
+                            : u.name,
+                    style: TextStyle(fontSize: 11, color: s.isLive(u.id) ? Colors.white : Colors.black),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
               ),
-            ),
-          ]),
+            ]),
+          ),
         ),
       );
 
@@ -356,10 +444,6 @@ class _MapPageState extends State<MapPage> {
         appBar: AppBar(
           title: Text(s.settings.name, overflow: TextOverflow.ellipsis),
           actions: [
-            Tooltip(
-              message: s.online ? 'Połączono z serwerem' : 'Brak połączenia – dane czekają w kolejce',
-              child: Icon(Icons.circle, size: 12, color: s.online ? Colors.green : Colors.red),
-            ),
             IconButton(
               tooltip: 'Zgłoszenia',
               icon: Badge(
@@ -383,7 +467,73 @@ class _MapPageState extends State<MapPage> {
             ),
           ],
         ),
-        body: Stack(children: [
+        body: Column(children: [
+          _connectionBanner(),
+          Expanded(child: _mapStack()),
+        ]),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: s.isAdmin ? _adminBar() : _userBar(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Pasek stanu połączenia – widoczny od razu po utracie sieci.
+  Widget _connectionBanner() {
+    final waiting = s.pendingCount + s.pendingReportsCount;
+    String title;
+    String? detail;
+    Color color;
+    IconData icon;
+    if (s.connecting) {
+      color = Colors.blueGrey;
+      icon = Icons.sync;
+      title = 'Łączenie z serwerem…';
+      detail = null;
+    } else if (!s.online) {
+      final since = s.offlineSince!;
+      final mins = DateTime.now().difference(since).inMinutes;
+      color = Colors.red.shade700;
+      icon = Icons.cloud_off;
+      title = 'BRAK POŁĄCZENIA${mins > 0 ? ' (od $mins min)' : ''}';
+      detail = s.isAdmin
+          ? 'Widzisz ostatni znany stan. Odświeży się sam, gdy wróci sieć.'
+          : 'Aplikacja działa dalej – szukaj normalnie. Ślad zapisuje się w telefonie'
+              '${waiting > 0 ? ' ($waiting do wysłania)' : ''} i wyśle się sam, gdy wróci sieć.';
+    } else if (waiting > 0) {
+      color = Colors.orange.shade800;
+      icon = Icons.cloud_upload;
+      title = 'Wysyłam zaległe dane… ($waiting)';
+      detail = null;
+    } else {
+      return const SizedBox.shrink();
+    }
+    return Material(
+      color: color,
+      child: SafeArea(
+        top: false,
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(children: [
+            Icon(icon, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                if (detail != null) Text(detail, style: const TextStyle(color: Colors.white, fontSize: 13)),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _mapStack() => Stack(children: [
           FlutterMap(
             mapController: _map,
             options: MapOptions(
@@ -426,16 +576,20 @@ class _MapPageState extends State<MapPage> {
                 child: const Icon(Icons.my_location),
               ),
             ),
-        ]),
-        bottomNavigationBar: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: s.isAdmin ? _adminBar() : _userBar(),
-          ),
-        ),
-      ),
-    );
-  }
+          if (!s.isAdmin)
+            Positioned(
+              left: 12,
+              bottom: 12,
+              child: FloatingActionButton.extended(
+                heroTag: 'cam',
+                backgroundColor: Colors.red.shade700,
+                foregroundColor: Colors.white,
+                onPressed: s.online ? _broadcast : () => _error('Kamera działa tylko z połączeniem z serwerem'),
+                icon: const Icon(Icons.videocam),
+                label: const Text('Kamera'),
+              ),
+            ),
+        ]);
 
   Widget _statusCard(List<Widget> children) => Card(
         child: Padding(
@@ -463,11 +617,10 @@ class _MapPageState extends State<MapPage> {
           style: TextStyle(color: fix.acc > s.settings.maxAccuracy ? Colors.orange.shade800 : null),
         ),
       Text(
-        '${s.tracking ? 'Zapisuję ślad' : 'Ślad wyłączony'}'
-        ' · promień ${(s.me?.radius ?? s.settings.defaultRadius).round()} m'
-        ' · ${s.calibrated ? 'kalibracja ${ago(s.calibratedAt)}' : 'bez kalibracji'}'
-        '${s.pendingCount > 0 ? ' · w kolejce ${s.pendingCount}' : ''}',
+        '${s.tracking ? 'Zapisuję ślad' : 'Ślad wyłączony – naciśnij „Szukam”'}'
+        ' · ${s.calibrated ? 'skalibrowano ${ago(s.calibratedAt)}' : 'bez kalibracji'}',
       ),
+      if (s.tilesRunning) Text('Pobieram mapę do telefonu: ${s.tilesDone}/${s.tilesTotal}'),
     ]);
   }
 
@@ -480,6 +633,7 @@ class _MapPageState extends State<MapPage> {
         '${cov != null ? 'Przeszukano ${cov.totalPercent.toStringAsFixed(1)}% obszaru' : 'Zaznacz obszar akcji'}'
         ' · aktywni $active/${s.users.length}',
       ),
+      if (s.tilesRunning) Text('Pobieram mapę offline na serwer: ${s.tilesDone}/${s.tilesTotal}'),
       if (_tool == AdminTool.area)
         Text(_firstCorner == null ? 'Kliknij pierwszy róg obszaru' : 'Kliknij przeciwległy róg',
             style: const TextStyle(color: Colors.red)),
@@ -543,7 +697,19 @@ class _MapPageState extends State<MapPage> {
           ActionChip(
             avatar: const Icon(Icons.group),
             label: Text('Uczestnicy (${s.users.length})'),
-            onPressed: () => showUsersSheet(context, s, onSelect: (u) => _goTo(LatLng(u.lat!, u.lon!))),
+            onPressed: () => showUsersSheet(context, s, _userActions),
+          ),
+          ActionChip(
+            avatar: const Icon(Icons.download_for_offline),
+            label: const Text('Mapa offline'),
+            onPressed: s.tilesRunning
+                ? null
+                : () => s.prefetchTilesOnServer().then((_) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                            content: Text('Serwer pobiera mapę obszaru. Telefony ściągną ją od niego automatycznie.')));
+                      }
+                    }).catchError(_error),
           ),
         ],
       );

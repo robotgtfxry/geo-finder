@@ -12,6 +12,8 @@ import 'api.dart';
 import 'coverage.dart';
 import 'models.dart';
 import 'notifications.dart';
+import 'tiles/cached_tiles.dart';
+import 'tiles/tile_store.dart';
 
 /// Pozycja po korekcie kalibracyjnej.
 class Fix {
@@ -40,7 +42,10 @@ class SessionController extends ChangeNotifier {
   int? myId;
 
   Settings settings = const Settings();
-  Map<String, String> categories = const {};
+  // nadpisywane przez serwer; te są na wypadek pierwszego uruchomienia bez sieci
+  Map<String, String> categories = const {
+    'trace': 'Ślad', 'item': 'Przedmiot', 'person': 'Osoba', 'danger': 'Zagrożenie', 'other': 'Inne',
+  };
   final Map<int, AppUser> users = {};
   final List<Report> reports = [];
   final List<TrackPoint> points = [];
@@ -48,7 +53,6 @@ class SessionController extends ChangeNotifier {
   String? joinCode;
   Coverage? coverage;
 
-  bool online = false;
   bool tracking = false;
   String? locationError;
   Fix? myFix;
@@ -62,13 +66,46 @@ class SessionController extends ChangeNotifier {
   final _incoming = StreamController<Report>.broadcast();
   Stream<Report> get incomingReports => _incoming.stream;
 
-  final List<Map<String, dynamic>> _pending = []; // punkty czekające na wysłanie
+  // ---- kamera na żywo
+  /// Id tego połączenia WebSocket nadane przez serwer.
+  String? myCid;
+
+  /// Kto teraz nadaje obraz: id uczestnika -> cid jego połączenia.
+  final Map<int, String> live = {};
+  final _rtc = StreamController<(String from, Map<String, dynamic> data)>.broadcast();
+  Stream<(String, Map<String, dynamic>)> get rtcMessages => _rtc.stream;
+
+  /// Uczestnik: koordynator prosi o kamerę (wartość = cid koordynatora).
+  final _streamRequests = StreamController<String>.broadcast();
+  Stream<String> get streamRequests => _streamRequests.stream;
+
+  /// Koordynator: zdarzenia „uczestnik włączył kamerę, o którą prosiłem”
+  /// (id uczestnika) i „odmówił” (ujemne id).
+  final _streamAnswers = StreamController<int>.broadcast();
+  Stream<int> get streamAnswers => _streamAnswers.stream;
+  final Set<int> _requested = {};
+
+  // Kolejka offline: punkty śladu i zgłoszenia czekające na wysłanie.
+  // Zapisywana w telefonie, więc przetrwa też restart aplikacji.
+  final List<Map<String, dynamic>> _pending = [];
+  final List<Map<String, dynamic>> _pendingReports = [];
+  bool _pendingDirty = false;
+  Set<int>? _knownReports;
+
+  /// Od kiedy nie ma połączenia (null = jest połączenie).
+  DateTime? offlineSince;
+  DateTime _lastMessage = DateTime.now();
+
+  /// Pobieranie mapy offline: do telefonu (uczestnik) albo na serwer (admin).
+  int tilesDone = 0, tilesTotal = 0;
+  bool tilesRunning = false;
+
   Fix? _lastRecorded;
   double _lastPosSent = 0;
   StreamSubscription<Position>? _posSub;
   WebSocketChannel? _ws;
   StreamSubscription? _wsSub;
-  Timer? _flushTimer, _reconnectTimer, _tickTimer;
+  Timer? _flushTimer, _reconnectTimer, _tickTimer, _pingTimer;
   bool _disposed = false;
   int _strokesVersion = -1;
   List<Stroke> _strokes = const [];
@@ -83,7 +120,8 @@ class SessionController extends ChangeNotifier {
   // ------------------------------------------------------------ logowanie
 
   static const _kServer = 'server', _kToken = 'token', _kRole = 'role', _kUserId = 'user_id';
-  static const _kCal = 'calibration';
+  static const _kCal = 'calibration', _kPending = 'pending', _kState = 'state_cache';
+  static const _kTracking = 'tracking', _kTilesArea = 'tiles_area';
 
   static Future<SessionController?> restore() async {
     final p = await SharedPreferences.getInstance();
@@ -117,7 +155,9 @@ class SessionController extends ChangeNotifier {
     await p.setString(_kServer, server);
     await p.setString(_kToken, token);
     await p.setString(_kRole, role);
-    await p.remove(_kCal);
+    for (final k in [_kCal, _kPending, _kState, _kTracking, _kTilesArea]) {
+      await p.remove(k);
+    }
     if (userId == null) {
       await p.remove(_kUserId);
     } else {
@@ -126,11 +166,13 @@ class SessionController extends ChangeNotifier {
   }
 
   Future<void> logout() async {
+    _pending.clear();
+    _pendingReports.clear();
+    _pendingDirty = false;
     final p = await SharedPreferences.getInstance();
-    await p.remove(_kToken);
-    await p.remove(_kRole);
-    await p.remove(_kUserId);
-    await p.remove(_kCal);
+    for (final k in [_kToken, _kRole, _kUserId, _kCal, _kPending, _kState, _kTracking, _kTilesArea]) {
+      await p.remove(k);
+    }
     dispose();
   }
 
@@ -145,6 +187,20 @@ class SessionController extends ChangeNotifier {
       _calDLon = (j['dlon'] as num).toDouble();
       calibratedAt = (j['t'] as num).toDouble();
     }
+    final pending = p.getString(_kPending);
+    if (pending != null) {
+      final j = jsonDecode(pending);
+      _pending.addAll((j['points'] as List).cast<Map<String, dynamic>>());
+      _pendingReports.addAll((j['reports'] as List).cast<Map<String, dynamic>>());
+    }
+    tracking = p.getBool(_kTracking) ?? false;
+    // ostatni znany stan – żeby siatka i zgłoszenia były widoczne także bez sieci
+    final cached = p.getString(_kState);
+    if (cached != null) {
+      try {
+        _applyState(jsonDecode(cached) as Map<String, dynamic>);
+      } catch (_) {}
+    }
     await Notifier.init();
     try {
       await loadState();
@@ -153,16 +209,27 @@ class SessionController extends ChangeNotifier {
       _notify();
       if (kicked) return;
     } catch (_) {
-      // serwer niedostępny – stan dociągnie się po połączeniu WebSocketu
+      // serwer niedostępny – aplikacja działa dalej, dane czekają w kolejce
     }
     _connectWs();
     _flushTimer = Timer.periodic(const Duration(seconds: 5), (_) => _flush());
     _tickTimer = Timer.periodic(const Duration(seconds: 15), (_) => _notify()); // odświeża „x min temu”
+    _pingTimer = Timer.periodic(const Duration(seconds: 4), (_) => _ping());
     if (!isAdmin) await _startLocation();
   }
 
   Future<void> loadState() async {
     final st = await api.get('/api/state') as Map<String, dynamic>;
+    _applyState(st);
+    if (!isAdmin && me == null) kicked = true;
+    SharedPreferences.getInstance().then((p) => p.setString(_kState, jsonEncode(st)));
+    await _fetchPoints();
+    _setOnline(true);
+    _notify();
+    _prefetchTilesToPhone();
+  }
+
+  void _applyState(Map<String, dynamic> st) {
     final old = settings;
     settings = Settings.fromJson(st['settings']);
     categories = (st['categories'] as Map).cast<String, String>();
@@ -176,10 +243,18 @@ class SessionController extends ChangeNotifier {
     reports
       ..clear()
       ..addAll((st['reports'] as List).map((r) => Report.fromJson(r)));
-    if (!isAdmin && me == null) kicked = true;
+    // zgłoszenia, które przyszły, gdy nie mieliśmy sieci – pokazujemy je po powrocie
+    final known = _knownReports;
+    if (known != null) {
+      for (final r in reports) {
+        if (!known.contains(r.id) && r.user != myId) {
+          _incoming.add(r);
+          Notifier.show(r);
+        }
+      }
+    }
+    _knownReports = reports.map((r) => r.id).toSet();
     if (coverage == null || _gridChanged(old, settings)) _rebuildCoverage();
-    await _fetchPoints();
-    _notify();
   }
 
   Future<void> _fetchPoints() async {
@@ -222,29 +297,97 @@ class SessionController extends ChangeNotifier {
     _ws = ch;
     _wsSub = ch.stream.listen(
       (data) => _onMessage(jsonDecode(data as String) as Map<String, dynamic>),
-      onError: (_) => _wsClosed(),
-      onDone: _wsClosed,
+      onError: (_) => _wsClosed(ch),
+      onDone: () => _wsClosed(ch),
       cancelOnError: true,
     );
     ch.ready.then((_) async {
-      online = true;
-      _notify();
+      _lastMessage = DateTime.now();
       try {
         await loadState(); // dociągamy to, co przegapiliśmy podczas przerwy
+        _flush(); // i od razu wysyłamy zaległy ślad
       } catch (_) {}
     }, onError: (_) {});
   }
 
-  void _wsClosed() {
-    online = false;
+  void _wsClosed(WebSocketChannel ch) {
+    if (ch != _ws) return; // stare połączenie, już zastąpione
+    _ws = null;
     _wsSub?.cancel();
-    _notify();
+    _setOnline(false);
     _reconnectTimer?.cancel();
     if (!_disposed) _reconnectTimer = Timer(const Duration(seconds: 3), _connectWs);
   }
 
+  /// Serwer odpowiada „pong” na każdy „ping”. Cisza dłużej niż 10 s oznacza,
+  /// że sieć padła, nawet jeśli system jeszcze nie zamknął połączenia.
+  void _ping() {
+    final ch = _ws;
+    if (ch == null) return;
+    try {
+      ch.sink.add('ping');
+    } catch (_) {}
+    if (DateTime.now().difference(_lastMessage) > const Duration(seconds: 10)) {
+      ch.sink.close();
+      _wsClosed(ch);
+    }
+  }
+
+  bool get online => offlineSince == null && _connectedOnce;
+  bool _connectedOnce = false;
+
+  /// Jeszcze nie udało się połączyć od uruchomienia aplikacji.
+  bool get connecting => !_connectedOnce && offlineSince == null;
+
+  void _setOnline(bool on) {
+    if (on) {
+      _connectedOnce = true;
+      offlineSince = null;
+    } else {
+      offlineSince ??= DateTime.now();
+    }
+    _notify();
+  }
+
   void _onMessage(Map<String, dynamic> m) {
+    _lastMessage = DateTime.now();
     switch (m['type']) {
+      case 'pong':
+        if (!online && _connectedOnce) _setOnline(true);
+        return;
+      case 'hello':
+        myCid = m['cid'] as String;
+        live
+          ..clear()
+          ..addAll((m['live'] as Map).map((k, v) => MapEntry(int.parse(k as String), v as String)));
+      case 'live':
+        {
+          final id = m['id'] as int, cid = m['cid'] as String?;
+          if (cid == null) {
+            live.remove(id);
+          } else {
+            live[id] = cid;
+            if (_requested.remove(id)) _streamAnswers.add(id);
+          }
+        }
+      case 'rtc':
+        _rtc.add((m['from'] as String, (m['data'] as Map).cast<String, dynamic>()));
+        return;
+      case 'stream_request':
+        _streamRequests.add(m['from'] as String);
+        return;
+      case 'stream_declined':
+        {
+          final id = m['id'] as int;
+          if (_requested.remove(id)) _streamAnswers.add(-id);
+        }
+      case 'tiles':
+        if (isAdmin) {
+          // postęp pobierania map na serwer
+          tilesDone = m['done'] as int;
+          tilesTotal = m['total'] as int;
+          tilesRunning = m['running'] as bool;
+        }
       case 'points':
         _addPoints((m['points'] as List).map((l) => TrackPoint.fromList(l)));
       case 'pos':
@@ -274,6 +417,7 @@ class SessionController extends ChangeNotifier {
           final r = Report.fromJson(m['report']);
           if (reports.any((x) => x.id == r.id)) break;
           reports.add(r);
+          _knownReports?.add(r.id);
           _incoming.add(r);
           if (r.user != myId) Notifier.show(r);
         }
@@ -363,8 +507,12 @@ class SessionController extends ChangeNotifier {
           distanceM(last.lat, last.lon, fix.lat, fix.lon) >= 3 ||
           fix.t - last.t >= 30) {
         _lastRecorded = fix;
-        _pending.add({'lat': fix.lat, 'lon': fix.lon, 'acc': fix.acc, 't': fix.t});
-        if (_pending.length > 5000) _pending.removeAt(0);
+        _pending.add({
+          'lat': fix.lat, 'lon': fix.lon, 'acc': fix.acc, 't': fix.t,
+          'r': me?.radius ?? settings.defaultRadius, // promień ustawiony przez koordynatora
+        });
+        if (_pending.length > 30000) _pending.removeAt(0); // ok. 10+ godzin chodzenia bez sieci
+        _pendingDirty = true;
         _version++;
       }
     } else if (!tracking && t - _lastPosSent >= 15) {
@@ -378,28 +526,85 @@ class SessionController extends ChangeNotifier {
   }
 
   bool _flushing = false;
+  int _flushTick = 0;
+
+  /// Wysyła kolejkę: najpierw zaległe zgłoszenia, potem ślad (partiami).
+  /// Bez sieci nic nie traci – dane zostają w telefonie do następnej próby.
   Future<void> _flush() async {
-    if (_flushing || _pending.isEmpty) return;
+    if (++_flushTick % 3 == 0) _persistPending();
+    if (_flushing || offlineSince != null || (_pending.isEmpty && _pendingReports.isEmpty)) return;
     _flushing = true;
-    final batch = List.of(_pending.take(200));
     try {
-      await api.post('/api/points', {'points': batch});
-      _pending.removeRange(0, batch.length);
-      _lastPosSent = nowSeconds();
-      _version++;
+      while (_pendingReports.isNotEmpty) {
+        await api.post('/api/reports', _pendingReports.first);
+        _pendingReports.removeAt(0);
+        _pendingDirty = true;
+      }
+      while (_pending.isNotEmpty) {
+        final batch = List.of(_pending.take(500));
+        await api.post('/api/points', {'points': batch});
+        _pending.removeRange(0, batch.length);
+        _pendingDirty = true;
+        _lastPosSent = nowSeconds();
+        _version++;
+        _notify();
+      }
     } catch (_) {
-      // brak zasięgu – spróbujemy przy następnym cyklu, punkty czekają w buforze
+      _setOnline(false); // sieć padła w trakcie – pasek „brak połączenia” od razu
     } finally {
       _flushing = false;
+      _persistPending();
+      _notify();
     }
   }
 
+  Future<void> _persistPending() async {
+    if (!_pendingDirty) return;
+    _pendingDirty = false;
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kPending, jsonEncode({'points': _pending, 'reports': _pendingReports}));
+  }
+
   int get pendingCount => _pending.length;
+  int get pendingReportsCount => _pendingReports.length;
 
   void setTracking(bool on) {
     tracking = on;
     _lastRecorded = null;
+    SharedPreferences.getInstance().then((p) => p.setBool(_kTracking, on));
     if (!on) _flush();
+    _notify();
+  }
+
+  // ------------------------------------------------------------ mapy offline
+
+  /// Uczestnik: po połączeniu ściągamy do telefonu mapę całego obszaru akcji
+  /// (raz na dany obszar), żeby działała w terenie bez zasięgu.
+  Future<void> _prefetchTilesToPhone() async {
+    final a = settings.area;
+    if (isAdmin || a == null || tilesRunning || !TileStore.supported) return;
+    final key = jsonEncode(a.toJson());
+    final p = await SharedPreferences.getInstance();
+    if (p.getString(_kTilesArea) == key) return;
+    if (TileCache.tilesFor(a).length > 8000) return; // za duży obszar na telefon
+    tilesRunning = true;
+    _notify();
+    final failed = await TileCache.prefetch(api.base, a, (done, total) {
+      tilesDone = done;
+      tilesTotal = total;
+      if (done % 20 == 0 || done == total) _notify();
+    }, cancelled: () => _disposed);
+    tilesRunning = false;
+    if (failed == 0 && !_disposed) await p.setString(_kTilesArea, key);
+    _notify();
+  }
+
+  /// Admin: serwer pobiera z internetu mapę obszaru i trzyma ją u siebie.
+  Future<void> prefetchTilesOnServer() async {
+    final r = await api.post('/api/tiles/prefetch');
+    tilesTotal = r['total'] as int;
+    tilesDone = r['done'] as int;
+    tilesRunning = true;
     _notify();
   }
 
@@ -470,11 +675,47 @@ class SessionController extends ChangeNotifier {
 
   // ------------------------------------------------------------ zgłoszenia
 
-  Future<Report> sendReport(LatLng at, String category, String text) async {
-    final r = await api.post('/api/reports',
-        {'lat': at.latitude, 'lon': at.longitude, 'category': category, 'text': text});
-    return Report.fromJson(r);
+  /// Wysyła zgłoszenie. Bez sieci zwraca null – zgłoszenie czeka w kolejce
+  /// (z oryginalnym czasem) i pójdzie samo, gdy wróci połączenie.
+  Future<Report?> sendReport(LatLng at, String category, String text) async {
+    final body = {'lat': at.latitude, 'lon': at.longitude, 'category': category, 'text': text, 't': nowSeconds()};
+    if (offlineSince == null) {
+      try {
+        return Report.fromJson(await api.post('/api/reports', body));
+      } on ApiException {
+        rethrow; // serwer odpowiedział błędem – to nie problem z siecią
+      } catch (_) {
+        _setOnline(false);
+      }
+    }
+    _pendingReports.add(body);
+    _pendingDirty = true;
+    await _persistPending();
+    _notify();
+    return null;
   }
+
+  // ------------------------------------------------------------ kamera na żywo
+
+  /// Wysyła wiadomość przez WebSocket. Zwraca false, gdy nie ma połączenia.
+  bool sendWs(Map<String, dynamic> msg) {
+    final ch = _ws;
+    if (ch == null || !online) return false;
+    ch.sink.add(jsonEncode(msg));
+    return true;
+  }
+
+  void sendRtc(String to, Map<String, dynamic> data) => sendWs({'type': 'rtc', 'to': to, 'data': data});
+  void setLive(bool on) => sendWs({'type': 'live', 'live': on});
+  void declineStream(String adminCid) => sendWs({'type': 'stream_declined', 'to': adminCid});
+
+  /// Koordynator prosi uczestnika o włączenie kamery.
+  bool requestStream(int userId) {
+    _requested.add(userId);
+    return sendWs({'type': 'stream_request', 'user': userId});
+  }
+
+  bool isLive(int userId) => live.containsKey(userId);
 
   // ------------------------------------------------------------ admin
 
@@ -493,7 +734,7 @@ class SessionController extends ChangeNotifier {
     final all = List.of(points);
     final r = me?.radius ?? settings.defaultRadius;
     for (final p in _pending) {
-      all.add(TrackPoint(-1, myId ?? -1, p['lat'], p['lon'], r, p['t']));
+      all.add(TrackPoint(-1, myId ?? -1, p['lat'], p['lon'], (p['r'] as num?)?.toDouble() ?? r, p['t']));
     }
     final lastByUser = <int, TrackPoint>{};
     final current = <int, Stroke>{};
@@ -522,13 +763,18 @@ class SessionController extends ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _persistPending();
     _posSub?.cancel();
     _wsSub?.cancel();
     _ws?.sink.close();
+    _pingTimer?.cancel();
     _flushTimer?.cancel();
     _reconnectTimer?.cancel();
     _tickTimer?.cancel();
     _incoming.close();
+    _rtc.close();
+    _streamRequests.close();
+    _streamAnswers.close();
     super.dispose();
   }
 }
